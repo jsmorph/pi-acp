@@ -14,6 +14,7 @@ import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/proces
 import { SessionStore } from './session-store.js'
 import { toolResultToText } from './translate/pi-tools.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
+import type { ExtMethodToolBridge } from './ext-method-tools.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -21,6 +22,8 @@ type SessionCreateParams = {
   conn: AgentSideConnection
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
+  bridge?: ExtMethodToolBridge
+  bridgeToken?: string | null
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
@@ -59,6 +62,11 @@ export class SessionManager {
     const s = this.sessions.get(sessionId)
     if (!s) return
     try {
+      s.dispose()
+    } catch {
+      // ignore
+    }
+    try {
       s.proc.dispose?.()
     } catch {
       // ignore
@@ -75,15 +83,19 @@ export class SessionManager {
   }
 
   async create(params: SessionCreateParams): Promise<PiAcpSession> {
+    const bridgeSpawnConfig = (await params.bridge?.prepareSpawn()) ?? null
     // Let pi manage session persistence in its default location (~/.pi/agent/sessions/...)
     // so sessions are visible to the regular `pi` CLI.
     let proc: PiRpcProcess
     try {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
-        piCommand: params.piCommand
+        piCommand: params.piCommand,
+        extraArgs: bridgeSpawnConfig?.args,
+        env: bridgeSpawnConfig?.env
       })
     } catch (e) {
+      params.bridge?.unregisterSessionToken(bridgeSpawnConfig?.token)
       if (e instanceof PiRpcSpawnError) {
         throw RequestError.internalError({ code: e.code }, e.message)
       }
@@ -100,6 +112,8 @@ export class SessionManager {
     const sessionId = typeof state?.sessionId === 'string' ? state.sessionId : crypto.randomUUID()
     const sessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
 
+    params.bridge?.bindToken(bridgeSpawnConfig?.token, sessionId, params.conn)
+
     if (sessionFile) {
       this.store.upsert({ sessionId, cwd: params.cwd, sessionFile })
     }
@@ -110,7 +124,9 @@ export class SessionManager {
       mcpServers: params.mcpServers,
       proc,
       conn: params.conn,
-      fileCommands: params.fileCommands ?? []
+      fileCommands: params.fileCommands ?? [],
+      bridge: params.bridge,
+      bridgeToken: bridgeSpawnConfig?.token ?? null
     })
 
     this.sessions.set(sessionId, session)
@@ -131,13 +147,17 @@ export class SessionManager {
     const existing = this.sessions.get(sessionId)
     if (existing) return existing
 
+    params.bridge?.bindToken(params.bridgeToken ?? null, sessionId, params.conn)
+
     const session = new PiAcpSession({
       sessionId,
       cwd: params.cwd,
       mcpServers: params.mcpServers,
       proc: params.proc,
       conn: params.conn,
-      fileCommands: params.fileCommands ?? []
+      fileCommands: params.fileCommands ?? [],
+      bridge: params.bridge,
+      bridgeToken: params.bridgeToken ?? null
     })
 
     this.sessions.set(sessionId, session)
@@ -156,6 +176,8 @@ export class PiAcpSession {
   readonly proc: PiRpcProcess
   private readonly conn: AgentSideConnection
   private readonly fileCommands: FileSlashCommand[]
+  private readonly bridge: ExtMethodToolBridge | undefined
+  private readonly bridgeToken: string | null
 
   // Used to map abort semantics to ACP stopReason.
   // Applies to the currently running turn.
@@ -189,6 +211,8 @@ export class PiAcpSession {
     proc: PiRpcProcess
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
+    bridge?: ExtMethodToolBridge
+    bridgeToken?: string | null
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -196,8 +220,14 @@ export class PiAcpSession {
     this.proc = opts.proc
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
+    this.bridge = opts.bridge
+    this.bridgeToken = opts.bridgeToken ?? null
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
+  }
+
+  dispose(): void {
+    this.bridge?.unregisterSessionToken(this.bridgeToken)
   }
 
   setStartupInfo(text: string) {

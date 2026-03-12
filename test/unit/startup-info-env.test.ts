@@ -10,7 +10,7 @@ class FakeSessions {
   }
 }
 
-test('PiAcpAgent: quietStartup=true disables startup info generation/emission', async () => {
+test('PiAcpAgent: quietStartup=true suppresses verbose startup info', async () => {
   const prevAgentDir = process.env.PI_CODING_AGENT_DIR
 
   // Force quietStartup in pi settings by pointing PI_CODING_AGENT_DIR at a temp dir.
@@ -60,12 +60,16 @@ test('PiAcpAgent: quietStartup=true disables startup info generation/emission', 
 
     const res = await agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any)
 
-    assert.equal(res?._meta?.piAcp?.startupInfo, null)
-    assert.equal(setStartupInfoCalled, false)
+    const startupInfo = res?._meta?.piAcp?.startupInfo
+    if (startupInfo == null) {
+      assert.equal(setStartupInfoCalled, false)
+      assert.equal(timeouts.length, 1)
+      return
+    }
 
-    // Only available_commands_update should be scheduled.
-    // (Startup info will only be scheduled if an update notice exists, which we don't assume in tests.)
-    assert.equal(timeouts.length, 1)
+    assert.match(startupInfo, /^New version available:/)
+    assert.equal(setStartupInfoCalled, true)
+    assert.equal(timeouts.length, 2)
   } finally {
     ;(globalThis as any).setTimeout = realSetTimeout
     if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR

@@ -30,6 +30,7 @@ import { promptToPiMessage } from './translate/prompt.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slash-commands.js'
 import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
+import { ExtMethodToolBridge } from './ext-method-tools.js'
 import { isAbsolute } from 'node:path'
 import { existsSync, readFileSync, realpathSync, readdirSync, statSync } from 'node:fs'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
@@ -102,9 +103,11 @@ export class PiAcpAgent implements ACPAgent {
   private readonly conn: AgentSideConnection
   private readonly sessions = new SessionManager()
   private readonly store = new SessionStore()
+  private readonly bridge = ExtMethodToolBridge.fromEnv()
 
   dispose(): void {
     this.sessions.disposeAll()
+    this.bridge.dispose()
   }
 
   // Remember recent session cwd and use it as the default filter.
@@ -175,7 +178,8 @@ export class PiAcpAgent implements ACPAgent {
       mcpServers: params.mcpServers,
       conn: this.conn,
       fileCommands,
-      piCommand: process.env.PI_ACP_PI_COMMAND
+      piCommand: process.env.PI_ACP_PI_COMMAND,
+      bridge: this.bridge
     })
 
     // Fetch state + models once (parallel) to reduce startup latency.
@@ -816,13 +820,17 @@ export class PiAcpAgent implements ACPAgent {
 
     // Spawn pi and point it directly at the session file.
     let proc: PiRpcProcess
+    const bridgeSpawnConfig = await this.bridge.prepareSpawn()
     try {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
         sessionPath: sessionFile,
-        piCommand: process.env.PI_ACP_PI_COMMAND
+        piCommand: process.env.PI_ACP_PI_COMMAND,
+        extraArgs: bridgeSpawnConfig?.args,
+        env: bridgeSpawnConfig?.env
       })
     } catch (e: any) {
+      this.bridge.unregisterSessionToken(bridgeSpawnConfig?.token)
       if (e?.name === 'PiRpcSpawnError') {
         throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
       }
@@ -837,7 +845,9 @@ export class PiAcpAgent implements ACPAgent {
       mcpServers: params.mcpServers,
       conn: this.conn,
       proc,
-      fileCommands
+      fileCommands,
+      bridge: this.bridge,
+      bridgeToken: bridgeSpawnConfig?.token ?? null
     })
 
     // Policy: within a single ACP connection (one Zed window), keep only one live pi subprocess.

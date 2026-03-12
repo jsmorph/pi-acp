@@ -69,6 +69,8 @@ type SpawnParams = {
   piCommand?: string
   /** If set, pi will persist the session to this exact file (via `--session <path>`). */
   sessionPath?: string
+  extraArgs?: string[]
+  env?: Record<string, string>
 }
 
 export class PiRpcProcess {
@@ -132,11 +134,12 @@ export class PiRpcProcess {
     // (e.g. MCP extensions, prompt templates for workflows).
     const args = ['--mode', 'rpc', '--no-themes']
     if (params.sessionPath) args.push('--session', params.sessionPath)
+    if (params.extraArgs?.length) args.push(...params.extraArgs)
 
     const child = spawn(cmd, args, {
       cwd: params.cwd,
       stdio: 'pipe',
-      env: process.env
+      env: { ...process.env, ...(params.env ?? {}) }
     })
 
     // Ensure spawn failures (e.g. ENOENT when pi isn't installed) are surfaced as a

@@ -5,9 +5,19 @@ type SessionUpdateMsg = Parameters<AgentSideConnection['sessionUpdate']>[0]
 
 export class FakeAgentSideConnection {
   readonly updates: SessionUpdateMsg[] = []
+  extMethodCalls: Array<{ method: string; params: Record<string, unknown> }> = []
+  extMethodHandler: ((method: string, params: Record<string, unknown>) => Promise<unknown> | unknown) | null = null
 
   async sessionUpdate(msg: SessionUpdateMsg): Promise<void> {
     this.updates.push(msg)
+  }
+
+  async extMethod(method: string, params: Record<string, unknown>): Promise<unknown> {
+    this.extMethodCalls.push({ method, params })
+    if (!this.extMethodHandler) {
+      throw new Error(`unexpected extMethod call: ${method}`)
+    }
+    return await this.extMethodHandler(method, params)
   }
 }
 
