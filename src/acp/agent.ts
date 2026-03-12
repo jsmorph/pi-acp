@@ -159,10 +159,15 @@ export class PiAcpAgent implements ACPAgent {
 
     this.lastSessionCwd = params.cwd
 
-    // IMPORTANT: pi exits immediately in --mode rpc if no model is available (no auth configured).
-    // So we must detect that situation without spawning pi, and return AUTH_REQUIRED so clients
-    // (e.g. Zed) can show the Authenticate banner and launch a terminal login.
-    if (!hasAnyPiAuthConfigured()) {
+    // If PI_ACP_PI_COMMAND overrides the child process, the host ACP server cannot
+    // reliably predict the child's auth state from its own env or ~/.pi/agent.
+    // In that case we must defer to the child process.
+    const shouldGateBeforeSpawn = !process.env.PI_ACP_PI_COMMAND
+
+    // IMPORTANT: upstream pi exits immediately in --mode rpc if no model is available.
+    // For the default host-side pi path, detect that before spawn so ACP clients can
+    // present AUTH_REQUIRED instead of an internal spawn failure.
+    if (shouldGateBeforeSpawn && !hasAnyPiAuthConfigured()) {
       throw RequestError.authRequired(
         { authMethods: getAuthMethods() },
         'Configure an API key or log in with an OAuth provider.'
