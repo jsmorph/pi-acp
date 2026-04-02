@@ -12,6 +12,7 @@ import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
 import { SessionStore } from './session-store.js'
+import { normalizePiAssistantText } from './translate/pi-messages.js'
 import { toolResultToText } from './translate/pi-tools.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import type { ExtMethodToolBridge } from './ext-method-tools.js'
@@ -194,6 +195,10 @@ export class PiAcpSession {
   // pi can emit multiple `turn_end` events for a single user prompt (e.g. after tool_use).
   // The overall agent loop completes when `agent_end` is emitted.
   private inAgentLoop = false
+  private promptErrorMessage: string | null = null
+  private sawAssistantTextDelta = false
+  private sawAssistantToolCallDelta = false
+  private readonly surfacedFinalMessages = new Set<string>()
 
   // For ACP diff support: capture file contents before edits, then emit ToolCallContent {type:"diff"}.
   // This is due to pi sending diff as a string as opposed to ACP expected diff format.
@@ -314,6 +319,10 @@ export class PiAcpSession {
     return this.cancelRequested
   }
 
+  getPromptErrorMessage(): string | null {
+    return this.promptErrorMessage
+  }
+
   private emit(update: SessionUpdate): void {
     // Serialize update delivery.
     this.lastEmit = this.lastEmit
@@ -336,6 +345,10 @@ export class PiAcpSession {
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
     this.inAgentLoop = false
+    this.promptErrorMessage = null
+    this.sawAssistantTextDelta = false
+    this.sawAssistantToolCallDelta = false
+    this.surfacedFinalMessages.clear()
 
     this.pendingTurn = { resolve: t.resolve, reject: t.reject }
 
@@ -357,6 +370,14 @@ export class PiAcpSession {
         if (authErr) {
           this.pendingTurn?.reject(authErr)
         } else {
+          const message = String((err as any)?.message ?? err ?? '').trim()
+          this.promptErrorMessage = message || null
+          if (message) {
+            this.emit({
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: `pi-acp prompt error: ${message}` } satisfies ContentBlock
+            })
+          }
           const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
           this.pendingTurn?.resolve(reason)
         }
@@ -384,6 +405,7 @@ export class PiAcpSession {
 
         // Stream assistant text.
         if (ame?.type === 'text_delta' && typeof ame.delta === 'string') {
+          this.sawAssistantTextDelta = true
           this.emit({
             sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text: ame.delta } satisfies ContentBlock
@@ -402,6 +424,7 @@ export class PiAcpSession {
         // Surface tool calls ASAP so clients (e.g. Zed) can show a tool-in-use/loading UI
         // while the model is still streaming tool call args.
         if (ame?.type === 'toolcall_start' || ame?.type === 'toolcall_delta' || ame?.type === 'toolcall_end') {
+          this.sawAssistantToolCallDelta = true
           const toolCall =
             // pi sometimes includes the tool call directly on the event
             (ame as any)?.toolCall ??
@@ -455,6 +478,11 @@ export class PiAcpSession {
         }
 
         // Ignore other delta/event types for now.
+        break
+      }
+
+      case 'message_end': {
+        this.emitFinalAssistantMessage((ev as any).message)
         break
       }
 
@@ -579,14 +607,17 @@ export class PiAcpSession {
       case 'turn_end': {
         // pi uses `turn_end` for sub-steps (e.g. tool_use) and will often start another turn.
         // Do NOT resolve the ACP `session/prompt` here; wait for `agent_end`.
+        this.emitFinalAssistantMessage((ev as any).message)
         break
       }
 
       case 'agent_end': {
+        const messages = Array.isArray((ev as any).messages) ? (ev as any).messages : []
+        for (const message of messages) this.emitFinalAssistantMessage(message)
         // Ensure all updates derived from pi events are delivered before we resolve
         // the ACP `session/prompt` request.
         void this.flushEmits().finally(() => {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
+          const reason: StopReason = this.cancelRequested ? 'cancelled' : this.promptErrorMessage ? 'error' : 'end_turn'
           this.pendingTurn?.resolve(reason)
           this.pendingTurn = null
           this.inAgentLoop = false
@@ -611,6 +642,51 @@ export class PiAcpSession {
 
       default:
         break
+    }
+  }
+
+  private emitFinalAssistantMessage(message: any): void {
+    if (!message || message.role !== 'assistant') return
+    const errorMessage = typeof message.errorMessage === 'string' ? message.errorMessage.trim() : ''
+    if (errorMessage) this.promptErrorMessage = errorMessage
+    let key = ''
+    try {
+      key = JSON.stringify(message)
+    } catch {
+      key = ''
+    }
+    if (key && this.surfacedFinalMessages.has(key)) return
+    if (key) this.surfacedFinalMessages.add(key)
+
+    const content = Array.isArray(message.content) ? message.content : []
+    if (!this.sawAssistantTextDelta) {
+      const text = normalizePiAssistantText(content)
+      if (text) {
+        this.emit({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text } satisfies ContentBlock
+        })
+      }
+    }
+    if (this.sawAssistantToolCallDelta) return
+    for (const block of content) {
+      if ((block as any)?.type !== 'toolCall') continue
+      const toolCallId = String((block as any)?.id ?? '')
+      if (!toolCallId || this.currentToolCalls.has(toolCallId)) continue
+      const toolName = String((block as any)?.name ?? 'tool')
+      const rawInput =
+        (block as any)?.arguments && typeof (block as any).arguments === 'object'
+          ? (block as any).arguments
+          : undefined
+      this.currentToolCalls.set(toolCallId, 'pending')
+      this.emit({
+        sessionUpdate: 'tool_call',
+        toolCallId,
+        title: toolName,
+        kind: toToolKind(toolName),
+        status: 'pending',
+        rawInput
+      })
     }
   }
 }
