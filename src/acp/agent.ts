@@ -104,6 +104,7 @@ export class PiAcpAgent implements ACPAgent {
   private readonly sessions = new SessionManager()
   private readonly store = new SessionStore()
   private readonly bridge = ExtMethodToolBridge.fromEnv()
+  private cachedInstructionsFile: { path: string; text: string } | null = null
 
   dispose(): void {
     this.sessions.disposeAll()
@@ -314,7 +315,8 @@ export class PiAcpAgent implements ACPAgent {
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     const session = this.sessions.get(params.sessionId)
 
-    const { message, images } = promptToPiMessage(params.prompt)
+    const promptBlocks = this.promptWithStandingInstructions(params.prompt)
+    const { message, images } = promptToPiMessage(promptBlocks)
 
     // Built-in ACP slash command handling (headless-friendly subset).
     // Note: file-based slash commands are expanded inside session.prompt().
@@ -769,6 +771,29 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     return { stopReason: result }
+  }
+
+  private promptWithStandingInstructions(prompt: PromptRequest['prompt']): PromptRequest['prompt'] {
+    const instructions = this.loadStandingInstructions()
+    if (!instructions) return prompt
+    return [{ type: 'text', text: `${instructions}\n\n` }, ...prompt]
+  }
+
+  private loadStandingInstructions(): string {
+    const path = String(process.env.PI_ACP_INSTRUCTIONS_FILE ?? '').trim()
+    if (!path) {
+      this.cachedInstructionsFile = null
+      return ''
+    }
+    if (this.cachedInstructionsFile && this.cachedInstructionsFile.path === path) {
+      return this.cachedInstructionsFile.text
+    }
+    const text = readFileSync(path, 'utf-8').trim()
+    if (!text) {
+      throw new Error(`PI_ACP_INSTRUCTIONS_FILE is empty: ${path}`)
+    }
+    this.cachedInstructionsFile = { path, text }
+    return text
   }
 
   async cancel(params: CancelNotification): Promise<void> {
